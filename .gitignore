@@ -72,3 +72,7 @@ tmpxft_*
 # Python
 __pycache__/
 *.pyc
+
+
+# third-party dependency
+nvbench/
