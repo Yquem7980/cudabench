@@ -1,0 +1,74 @@
+# build outputs
+build/
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# CUDA temp
+*.ptx
+*.cubin
+*.fatbin
+*.sass
+tmpxft_*
+
+# Nsight reports
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+
+# VS / VSCode
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.pyc
+
+
+
+# CMake / build
+build/
+bench/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+**/compile_commands.json
+
+# binaries
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# CUDA / temp
+*.ptx
+*.cubin
+*.fatbin
+*.sass
+tmpxft_*
+
+# Nsight
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+
+# VS / VSCode
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.pyc
