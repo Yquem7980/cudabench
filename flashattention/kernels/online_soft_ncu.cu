@@ -600,7 +600,7 @@ int main()
     printf("Running GPU kernels...\n");
 
 
-    float *d_Q, *d_K, *d_S, *d_P, *d_V, *d_O;
+    float *d_Q, *d_K, *d_S, *d_P, *d_V, *d_O,*d_O_fused;
 
     CHECK_CUDA(cudaMalloc(&d_Q, sizeQ));
     CHECK_CUDA(cudaMalloc(&d_K, sizeK));
@@ -608,6 +608,7 @@ int main()
     CHECK_CUDA(cudaMalloc(&d_P, sizeP));
     CHECK_CUDA(cudaMalloc(&d_V, sizeV));
     CHECK_CUDA(cudaMalloc(&d_O, sizeO));
+    CHECK_CUDA(cudaMalloc(&d_O_fused, sizeO));
 
     CHECK_CUDA(cudaMemcpy(d_Q, h_Q, sizeQ, cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_K, h_K, sizeK, cudaMemcpyHostToDevice));
@@ -629,7 +630,7 @@ int main()
     dim3 grid_qk(CEIL_DIV(N, 32), CEIL_DIV(M, 32));
     dim3 grid_softmax(M);
     dim3 grid_pv(CEIL_DIV(D, BD),CEIL_DIV(M, BM));
-    dim3 grid_fused(CEIL_DIV(M, 4));
+    dim3 grid_fused(M);
     
     // Step 1: QK^T
     qk_kernel<32,32,8,4,4><<<grid_qk, blockqk>>>(d_Q, d_K, d_S, M, N, D);
@@ -649,7 +650,7 @@ int main()
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Step 4: fused
-    flash_attn_fused_v1<32,128><<<grid_fused, block_fused>>>(d_Q, d_K, d_V, d_O, M, N);
+    flash_attn_fused_v1<32,128><<<grid_fused, block_fused>>>(d_Q, d_K, d_V, d_O_fused, M, N);
     CHECK_CUDA(cudaGetLastError());    
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -657,7 +658,7 @@ int main()
     CHECK_CUDA(cudaMemcpy(h_O_gpu, d_O, sizeO, cudaMemcpyDeviceToHost));
     printf("GPU done. O_gpu[0] = %.6f\n\n", h_O_gpu[0]);
 
-    CHECK_CUDA(cudaMemcpy(h_O_fused, d_O, sizeO, cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_O_fused, d_O_fused, sizeO, cudaMemcpyDeviceToHost));
     printf("GPU done. O_gpu[0] = %.6f\n\n", h_O_fused[0]);
 
         // ========== 验证 ==========
@@ -679,6 +680,7 @@ int main()
 
     printf("\nChecking final output O...\n");
     check_result(h_O_cpu, h_O_gpu, M * D, 1e-3f);
+    printf("\nChecking fused output O...\n");
     check_result(h_O_cpu, h_O_fused, M * D, 1e-3f);
 
     // 释放
@@ -688,6 +690,7 @@ int main()
     CHECK_CUDA(cudaFree(d_P));
     CHECK_CUDA(cudaFree(d_V));
     CHECK_CUDA(cudaFree(d_O));
+    CHECK_CUDA(cudaFree(d_O_fused));
 
     delete[] h_Q;
     delete[] h_K;
