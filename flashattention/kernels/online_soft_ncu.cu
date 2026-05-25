@@ -338,110 +338,6 @@ __global__ void softmax_kernel_v2(
     }
 }
 
-template<int BM, int BN>
-__global__ void softmax_tile_2d_online(
-    const float* __restrict__ S,   // [M, N]
-    float* __restrict__ P,         // [M, N]
-    int M,
-    int N)
-{
-     int tid  = threadIdx.x;
-    // ==============================
-    // 2D block mapping
-    // ==============================
-    int row_tile = blockIdx.y * BM;
-    int col_tile = blockIdx.x * BN;
-
-    int lane = threadIdx.x % 32;   // 0..31
-    int warp = threadIdx.x / 32; 
-    int row  = row_tile + warp;  // each warp row
-    
-    if (row >= M) return;
-
-    const float* row_ptr = S + row * N;
-    float* out_ptr = P + row * N;
-
-    // ==============================
-    // online softmax state
-    // ==============================
-    float m = -1e30f;
-    float l = 0.0f;
-
-    // ==============================
-    // iterate over N tiles
-    // ==============================
-    for (int col0 = 0; col0 < N; col0 += BN)
-    {
-        int col = col_tile + col0 + lane;
-
-        // load tile element
-        float x = -1e30f;
-        if (col < N)
-            x = row_ptr[col];
-
-        // ==============================
-        // tile max (warp reduce)
-        // ==============================
-        float tile_max = x;
-
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-        {
-            tile_max = fmaxf(tile_max,
-                __shfl_down_sync(0xffffffff, tile_max, off));
-        }
-
-        tile_max = __shfl_sync(0xffffffff, tile_max, 0);
-
-        // ==============================
-        // global max update
-        // ==============================
-        float m_new = fmaxf(m, tile_max);
-
-        // ==============================
-        // exp compute (with new max)
-        // ==============================
-        float exp_v = 0.0f;
-        if (col < N)
-            exp_v = expf(x - m_new);
-
-        float tile_sum = exp_v;
-
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1)
-        {
-            tile_sum += __shfl_down_sync(0xffffffff, tile_sum, off);
-        }
-
-        tile_sum = __shfl_sync(0xffffffff, tile_sum, 0);
-
-        // ==============================
-        // online update (CORRECT FORM)
-        // ==============================
-        float l_new =
-            l * expf(m - m_new) + tile_sum;
-
-        m = m_new;
-        l = l_new;
-    }
-
-    // ==============================
-    // second pass: normalize
-    // ==============================
-    for (int col0 = 0; col0 < N; col0 += BN)
-    {
-        int col = col_tile + col0 + lane;
-
-        if (col < N)
-        {
-            float x = row_ptr[col];
-            float p = expf(x - m) / l;
-            out_ptr[col] = p;
-        }
-    }
-}
-
-
 template <const int BM, const int BD, const int BN, const int TM, const int TD>
 __global__ void pv_kernel(
     const float* P,
@@ -512,25 +408,141 @@ __global__ void pv_kernel(
 }
 
 
-// dim3 block(16, 16);
+template <const int BN, const int D>
+__global__ void flash_attn_fused_v1(    
+    float* Q,
+    float* K,
+    float* V,
+    float* O,
+    int M,
+    int N)
+{
+    __shared__ float Qs[D];
+    __shared__ float Ks[BN][D];
+    __shared__ float Vs[BN][D];
+    __shared__ float scores[BN];
+    __shared__ float smem[256]; // reduction 用
 
-// dim3 grid_qk(
-//     (n + block.x - 1) / block.x,
-//     (m + block.y - 1) / block.y);
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
 
-// dim3 grid_softmax(
-//     (n + block.x - 1) / block.x,
-//     (m + block.y - 1) / block.y);
+    if (row >= M) return;
+    // // 假设每个 thread 负责一个 d
+    // if (tid >= D) return;
 
-// dim3 grid_pv(
-//     (d + block.x - 1) / block.x,
-//     (m + block.y - 1) / block.y);
+    for (int d = tid; d < D; d += blockDim.x) {//每个block读取一行Qs
+        Qs[d] = Q[row * D + d];
+    }
+    __syncthreads();
 
-// qk_kernel<<<grid_qk, block>>>(Q, K, S, m, n, d);
 
-// softmax_kernel<<<grid_softmax, block>>>(S, P, m, n);
 
-// pv_kernel<<<grid_pv, block>>>(P, V, O, m, n, d);
+    // online softmax state
+    float m = -1e30f;
+    float l = 0.0f;
+    float acc = 0.0f;// acc[d] 暂时先让每个线程负责一部分 D
+    float scale = rsqrtf((float)D);
+
+    for (int kv_start = 0; kv_start < N; kv_start += BN) {//每个block读取完整的K，V，即O[row, :] = softmax(Q[row, :] @ K[0:N, :].T) @ V[0:N, :] // 1. 当前处理哪一块 K/V tile
+        int tile_len = min(BN, N - kv_start);
+
+        for (int idx = tid; idx < tile_len * D; idx += blockDim.x) { // 2. 把当前 K/V tile 搬到 shared memory
+            int t = idx / D;
+            int d = idx % D;
+
+            Ks[t][d] = K[(kv_start + t) * D + d];
+            Vs[t][d] = V[(kv_start + t) * D + d];
+        }
+
+        __syncthreads();
+
+        for (int t = tid; t < tile_len; t += blockDim.x) {//每个block只有0-tile_len-1线程处理数据// 3. 计算当前 q_row 对 tile 内每个 K token 的 score
+            float sum = 0.0f;
+
+            for (int d = 0; d < D; d++) {
+                sum += Qs[d] * Ks[t][d];
+            }
+
+            scores[t] = sum * scale;
+        }
+        __syncthreads();
+    
+        // 3.3 tile_max = max(scores)
+        float local_max = -1e30f;
+
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            local_max = fmaxf(local_max, scores[t]);
+        }
+
+        // 写入 shared memory 做 block reduce
+        smem[tid] = local_max;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                smem[tid] = fmaxf(smem[tid], smem[tid + stride]);
+            }
+            __syncthreads();
+        }
+
+        float tile_max = smem[0];
+
+        // 3.4 m_new = max(m, tile_max)
+        float m_new = fmaxf(m, tile_max);
+
+        // 3.5 alpha = exp(m - m_new)
+        float alpha = expf(m - m_new);
+
+        // 3.6 beta_sum = sum(exp(scores[t] - m_new))
+        float local_beta = 0.0f;
+
+        for (int t = tid; t < tile_len; t += blockDim.x) {
+            local_beta += expf(scores[t] - m_new);
+        }
+
+        smem[tid] = local_beta;
+        __syncthreads();
+
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) {
+                smem[tid] += smem[tid + stride];
+            }
+            __syncthreads();
+        }
+
+        float beta_sum = smem[0];
+
+        // denominator update
+        float l_new = l * alpha + beta_sum;
+    
+    
+        // 2.7 acc[d] = acc[d] * alpha + sum_j beta_j * V[j, d]
+        if (tid < D) {
+            float acc_new = acc * alpha;
+
+            for (int j = 0; j < tile_len; j++) {
+                float beta_j = expf(scores[j] - m_new);
+                // acc_new += beta_j * Vs[j * D + tid];
+                acc_new += beta_j * Vs[j][tid];
+            }
+
+            acc = acc_new;
+        }
+
+        // 2.8 状态滚动
+        m = m_new;
+        l = l_new;
+
+        __syncthreads();
+    }
+
+    // 3. 最后归一化输出
+    if (tid < D) {
+        O[row * D + tid] = acc / l;
+    }
+
+
+}
 
 
 
@@ -554,6 +566,7 @@ int main()
     float *h_V = new float[N * D];
     float *h_O_gpu = new float[M * D];   // GPU 结果
     float *h_O_cpu = new float[M * D];   // CPU 参考结果   
+    float *h_O_fused = new float[M * D];   // GPU 结果
 
     srand(time(NULL));
     for (int i = 0; i < M * D; i++)
@@ -575,6 +588,8 @@ int main()
         h_O_gpu[i] = 0.0f;
     for (int i = 0; i < M * D; i++)
         h_O_cpu[i] = 0.0f;
+    for (int i = 0; i < M * D; i++)
+        h_O_fused[i] = 0.0f;
 
     // ========== CPU 参考计算 ==========
     printf("Running CPU reference...\n");
@@ -605,19 +620,17 @@ int main()
     constexpr int TD = 2;
     dim3 block(16, 16);
 
-    dim3 blockqk((BM/TM) * (BD/TD));
-    dim3 blocksoftmax(128);
-    dim3 blockpv((BM/TM) * (BD/TD));
+    dim3 blockqk(64);
+    dim3 blocksoftmax(256);
+    dim3 blockkv((BM/TM) * (BD/TD));
     size_t smem_size = blocksoftmax.x * sizeof(float);
+    dim3 block_fused(128);
 
     dim3 grid_qk(CEIL_DIV(N, 32), CEIL_DIV(M, 32));
-
-    // dim3 grid_softmax(M);
-    dim3 grid_softmax(1, CEIL_DIV(M, 32));
-
-    dim3 grid_pv(
-        CEIL_DIV(D, BD),CEIL_DIV(M, BM));
-
+    dim3 grid_softmax(M);
+    dim3 grid_pv(CEIL_DIV(D, BD),CEIL_DIV(M, BM));
+    dim3 grid_fused(CEIL_DIV(M, 4));
+    
     // Step 1: QK^T
     qk_kernel<32,32,8,4,4><<<grid_qk, blockqk>>>(d_Q, d_K, d_S, M, N, D);
     CHECK_CUDA(cudaGetLastError());    
@@ -625,14 +638,18 @@ int main()
     // CHECK_CUDA(cudaMemcpy(h_S, d_S, sizeS, cudaMemcpyDeviceToHost));
 
     // Step 2: Softmax
-    // softmax_kernel_v2<<<grid_softmax, blocksoftmax, smem_size>>>(d_S, d_P, M, N);
-    softmax_tile_2d_online<BM, BN><<<grid_softmax, blocksoftmax, smem_size>>>(d_S, d_P, M, N);
+    softmax_kernel_v2<<<grid_softmax, blocksoftmax, smem_size>>>(d_S, d_P, M, N);
     CHECK_CUDA(cudaGetLastError());    
     CHECK_CUDA(cudaDeviceSynchronize());
     // CHECK_CUDA(cudaMemcpy(h_P, d_P, sizeP, cudaMemcpyDeviceToHost));
 
     // Step 3: PV
-    pv_kernel<BM, BD, BN, TM, TD><<<grid_pv, blockpv>>>(d_P, d_V, d_O, M, N, D);
+    pv_kernel<BM, BD, BN, TM, TD><<<grid_pv, blockkv>>>(d_P, d_V, d_O, M, N, D);
+    CHECK_CUDA(cudaGetLastError());    
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // Step 4: fused
+    flash_attn_fused_v1<32,128><<<grid_fused, block_fused>>>(d_Q, d_K, d_V, d_O, M, N);
     CHECK_CUDA(cudaGetLastError());    
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -640,6 +657,8 @@ int main()
     CHECK_CUDA(cudaMemcpy(h_O_gpu, d_O, sizeO, cudaMemcpyDeviceToHost));
     printf("GPU done. O_gpu[0] = %.6f\n\n", h_O_gpu[0]);
 
+    CHECK_CUDA(cudaMemcpy(h_O_fused, d_O, sizeO, cudaMemcpyDeviceToHost));
+    printf("GPU done. O_gpu[0] = %.6f\n\n", h_O_fused[0]);
 
         // ========== 验证 ==========
     printf("Checking QK^T intermediate...\n");
@@ -660,6 +679,7 @@ int main()
 
     printf("\nChecking final output O...\n");
     check_result(h_O_cpu, h_O_gpu, M * D, 1e-3f);
+    check_result(h_O_cpu, h_O_fused, M * D, 1e-3f);
 
     // 释放
     CHECK_CUDA(cudaFree(d_Q));
@@ -676,6 +696,6 @@ int main()
     delete[] h_P;
     delete[] h_O_gpu;
     delete[] h_O_cpu;
-
+    delete[] h_O_fused;
     return 0;
 }
