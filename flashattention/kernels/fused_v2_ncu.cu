@@ -408,45 +408,80 @@ __global__ void pv_kernel(
 }
 
 
-template <const int BN, const int D>
-__global__ void flash_attn_fused_v1(    
-    float* Q,
-    float* K,
-    float* V,
-    float* O,
+template <const int BN, const int D, const int ROWS_PER_BLOCK = 4>
+__global__ void flash_attn_fused_v2(
+    const float* __restrict__ Q,   // [M, D]
+    const float* __restrict__ K,   // [N, D]
+    const float* __restrict__ V,   // [N, D]
+    float* __restrict__ O,         // [M, D]
     int M,
     int N)
 {
-    __shared__ float Qs[D];
+    static_assert(ROWS_PER_BLOCK == 4, "This kernel assumes 4 warps per block.");
+    static_assert(BN <= 32, "This simple version assumes BN <= 32.");
+
+    const int tid     = threadIdx.x;      // 0..127
+    const int lane    = tid & 31;         // 0..31
+    const int warp_id = tid >> 5;         // 0..3
+
+    const int row = blockIdx.x * ROWS_PER_BLOCK + warp_id;
+    const bool active = (row < M);
+
+    constexpr int VEC = (D + 31) / 32;
+
+    // 每个 block 处理 4 行 Q
+    __shared__ float Qs[ROWS_PER_BLOCK][D];
+
+    // K/V tile 被 4 行 Q 共享
     __shared__ float Ks[BN][D];
     __shared__ float Vs[BN][D];
-    __shared__ float scores[BN];
-    __shared__ float smem[256]; // reduction 用
 
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
+    // 每个 warp / row 有自己的 scores 和 probs
+    __shared__ float scores[ROWS_PER_BLOCK][BN];
+    __shared__ float probs[ROWS_PER_BLOCK][BN];
 
-    if (row >= M) return;
-    // // 假设每个 thread 负责一个 d
-    // if (tid >= D) return;
-
-    for (int d = tid; d < D; d += blockDim.x) {//每个block读取一行Qs
-        Qs[d] = Q[row * D + d];
+    // =============================
+    // 1. load Q tile
+    // 每个 warp 加载自己负责的那一行 Q
+    // =============================
+    if (active) {
+        for (int d = lane; d < D; d += 32) {
+            Qs[warp_id][d] = Q[row * D + d];//128thread->4warp, one warp read one row
+        }
     }
+
     __syncthreads();
 
-
-
-    // online softmax state
+    // =============================
+    // 2. online softmax state
+    // 每个 warp 负责一行，所以每个 warp 内 m/l 相同
+    // 每个 lane 负责 D 维中的若干个输出维度
+    // =============================
     float m = -1e30f;
     float l = 0.0f;
-    float acc = 0.0f;// acc[d] 暂时先让每个线程负责一部分 D
-    float scale = rsqrtf((float)D);
 
-    for (int kv_start = 0; kv_start < N; kv_start += BN) {//每个block读取完整的K，V，即O[row, :] = softmax(Q[row, :] @ K[0:N, :].T) @ V[0:N, :] // 1. 当前处理哪一块 K/V tile
-        int tile_len = min(BN, N - kv_start);
+    float acc[VEC];//每个thread存4个数据（D=128）
 
-        for (int idx = tid; idx < tile_len * D; idx += blockDim.x) { // 2. 把当前 K/V tile 搬到 shared memory
+    #pragma unroll
+    for (int i = 0; i < VEC; i++) {
+        acc[i] = 0.0f;
+    }
+
+    const float scale = rsqrtf((float)D);
+    const unsigned mask = 0xffffffff;
+
+    // =============================
+    // 3. streaming over K/V tiles
+    // =============================
+    for (int kv_start = 0; kv_start < N; kv_start += BN) {
+        const int tile_len = (BN < (N - kv_start)) ? BN : (N - kv_start);
+
+        // =====================================================
+        // 3.1 load K/V tile
+        // 整个 block 的 128 个 thread 共同加载 K/V tile
+        // 这份 K/V 会被 4 个 q_row 共享
+        // =====================================================
+        for (int idx = tid; idx < tile_len * D; idx += blockDim.x) {//read 0-BN-1（N - kv_start）行
             int t = idx / D;
             int d = idx % D;
 
@@ -456,93 +491,119 @@ __global__ void flash_attn_fused_v1(
 
         __syncthreads();
 
-        for (int t = tid; t < tile_len; t += blockDim.x) {//每个block只有0-tile_len-1线程处理数据// 3. 计算当前 q_row 对 tile 内每个 K token 的 score
+        // =====================================================
+        // 3.2 compute scores for this warp's row
+        // 简单版本：lane 对应一个 K token t
+        // lane 0..31 分别计算 scores[0..31]
+        // =====================================================
+        float my_score = -1e30f;
+
+        if (active && lane < tile_len) {
             float sum = 0.0f;
 
+            #pragma unroll
             for (int d = 0; d < D; d++) {
-                sum += Qs[d] * Ks[t][d];
+                sum += Qs[warp_id][d] * Ks[lane][d];//Qs的4行，分别乘Ks的32行，获得128个值,一个warp中Qs值相同，Ks值32个，若有输出矩阵，元素分布是在同一行不同列
             }
 
-            scores[t] = sum * scale;
+            my_score = sum * scale;
+            scores[warp_id][lane] = my_score;//存储S结果到shared memory，供block共享
         }
-        __syncthreads();
-    
+
+        __syncwarp(mask);//warp级别同步,if外，防止if和mask范围不一致
+
+        // =====================================================
         // 3.3 tile_max = max(scores)
-        float local_max = -1e30f;
+        // 每个 warp 内对当前 row 的 BN 个 score 求 max
+        // =====================================================
+        float local_max = my_score;
 
-        for (int t = tid; t < tile_len; t += blockDim.x) {
-            local_max = fmaxf(local_max, scores[t]);//scores是shared申明，block共享，防呆做的，tile_len=32，blockdim.x=128可以直接写smem[tid] = local_max;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            local_max = fmaxf(local_max, __shfl_down_sync(mask, local_max, off));//一个warp处理为输出矩阵的一行，所以线程内归约是对一行中部分tile进行归约
         }
 
-        // 写入 shared memory 做 block reduce
-        smem[tid] = local_max;
-        __syncthreads();
+        float tile_max = __shfl_sync(mask, local_max, 0);//更新每个线程为最大值
 
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                smem[tid] = fmaxf(smem[tid], smem[tid + stride]);//实际上warp级别归约就够用了
+        // =====================================================
+        // 3.4 online softmax max update
+        // =====================================================
+        float m_new = active ? fmaxf(m, tile_max) : m;//防止不是4的倍数的防呆
+        float alpha = active ? expf(m - m_new) : 1.0f;
+
+        // =====================================================
+        // 3.5 beta_j = exp(score_j - m_new)
+        // beta_sum = sum beta_j
+        // 每个 lane 只计算一个 beta，写入 probs 共享给 acc 阶段复用
+        // =====================================================
+        float beta = 0.0f;
+
+        if (active && lane < tile_len) {
+            beta = expf(scores[warp_id][lane] - m_new);
+            probs[warp_id][lane] = beta;//存储P结果到shared memory，行（Qs 4行）列（K 32行）
+        }
+
+        __syncwarp(mask);
+
+        float beta_sum_local = beta;
+
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            beta_sum_local += __shfl_down_sync(mask, beta_sum_local, off);//此tile求和
+        }
+
+        float beta_sum = __shfl_sync(mask, beta_sum_local, 0);
+
+        float l_new = active ? (l * alpha + beta_sum) : l;//到此为止找到目前最大值，完成softmax online
+
+        // =====================================================
+        // 3.6 acc[d] = acc[d] * alpha + sum_j beta_j * V[j][d]
+        // 每个 lane 负责 d = lane, lane+32, lane+64, ...
+        // =====================================================
+        if (active) {
+            #pragma unroll
+            for (int vi = 0; vi < VEC; vi++) {//每个warp处理一行，每个线程处理vec次
+                int d = lane + vi * 32;
+
+                if (d < D) {
+                    float acc_new = acc[vi] * alpha;//旧值因为max改变更新,这是和V乘过的旧值
+
+                    #pragma unroll
+                    for (int j = 0; j < BN; j++) {
+                        if (j < tile_len) {
+                            acc_new += probs[warp_id][j] * Vs[j][d];
+                        }
+                    }
+
+                    acc[vi] = acc_new;
+                }
             }
-            __syncthreads();
         }
 
-        float tile_max = smem[0];
-
-        // 3.4 m_new = max(m, tile_max)
-        float m_new = fmaxf(m, tile_max);
-
-        // 3.5 alpha = exp(m - m_new)
-        float alpha = expf(m - m_new);
-
-        // 3.6 beta_sum = sum(exp(scores[t] - m_new))
-        float local_beta = 0.0f;
-
-        for (int t = tid; t < tile_len; t += blockDim.x) {
-            local_beta += expf(scores[t] - m_new);
-        }
-
-        smem[tid] = local_beta;
-        __syncthreads();
-
-        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                smem[tid] += smem[tid + stride];
-            }
-            __syncthreads();
-        }
-
-        float beta_sum = smem[0];
-
-        // denominator update
-        float l_new = l * alpha + beta_sum;
-    
-    
-        // 2.7 acc[d] = acc[d] * alpha + sum_j beta_j * V[j, d]
-        if (tid < D) {
-            float acc_new = acc * alpha;
-
-            for (int j = 0; j < tile_len; j++) {
-                float beta_j = expf(scores[j] - m_new);
-                // acc_new += beta_j * Vs[j * D + tid];
-                acc_new += beta_j * Vs[j][tid];
-            }
-
-            acc = acc_new;
-        }
-
-        // 2.8 状态滚动
+        // 状态滚动
         m = m_new;
         l = l_new;
 
+        // 当前 tile 的 Ks/Vs 下一轮会被覆盖，所以 block 内所有线程同步
         __syncthreads();
     }
 
-    // 3. 最后归一化输出
-    if (tid < D) {
-        O[row * D + tid] = acc / l;
+    // =============================
+    // 4. final normalize and store O
+    // O[d] = acc[d] / l
+    // =============================
+    if (active) {
+        #pragma unroll
+        for (int vi = 0; vi < VEC; vi++) {
+            int d = lane + vi * 32;
+
+            if (d < D) {
+                O[row * D + d] = acc[vi] / l;
+            }
+        }
     }
-
-
 }
+
 
 
 
@@ -630,8 +691,9 @@ int main()
     dim3 grid_qk(CEIL_DIV(N, 32), CEIL_DIV(M, 32));
     dim3 grid_softmax(M);
     dim3 grid_pv(CEIL_DIV(D, BD),CEIL_DIV(M, BM));
-    dim3 grid_fused(M);
-    
+    dim3 grid_fused(CEIL_DIV(M, 4));
+    // dim3 grid_fused(M);
+
     // Step 1: QK^T
     qk_kernel<32,32,8,4,4><<<grid_qk, blockqk>>>(d_Q, d_K, d_S, M, N, D);
     CHECK_CUDA(cudaGetLastError());    
@@ -650,7 +712,7 @@ int main()
     CHECK_CUDA(cudaDeviceSynchronize());
 
     // Step 4: fused
-    flash_attn_fused_v1<32,128><<<grid_fused, block_fused>>>(d_Q, d_K, d_V, d_O_fused, M, N);
+    flash_attn_fused_v2<32,128><<<grid_fused, block_fused>>>(d_Q, d_K, d_V, d_O_fused, M, N);
     CHECK_CUDA(cudaGetLastError());    
     CHECK_CUDA(cudaDeviceSynchronize());
 
